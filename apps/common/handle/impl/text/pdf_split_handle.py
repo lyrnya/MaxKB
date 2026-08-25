@@ -19,8 +19,12 @@ from pypdf import PdfReader
 from pypdf.generic import Destination
 
 from common.handle.base_split_handle import BaseSplitHandle
+from common.handle.impl.text.ocr_handle import ocr_image
 from common.utils.logger import maxkb_logger
 from common.utils.split_model import SplitModel, smart_split_paragraph
+
+# 页面文字量低于该阈值且含图片时,判定为扫描页/图片页,触发 OCR
+OCR_SPARSE_TEXT_THRESHOLD = 30
 
 default_pattern_list = [
     re.compile("(?<=^)# .*|(?<=\\n)# .*"),
@@ -120,6 +124,7 @@ class PdfSplitHandle(BaseSplitHandle):
         content = ""
         for page_num, page in enumerate(pdf_document.pages):
             start_time = time.time()
+            page_content = ""
 
             for text, font_size in page_lines[page_num]:
                 if not text:
@@ -129,21 +134,40 @@ class PdfSplitHandle(BaseSplitHandle):
                 size_diff = font_size - body_font_size
 
                 if size_diff > 2:  # 明显大于正文
-                    content += f"## {text}\n\n"
+                    page_content += f"## {text}\n\n"
                 elif size_diff > 0.5:  # 略大于正文
-                    content += f"### {text}\n\n"
+                    page_content += f"### {text}\n\n"
                 else:  # 正文
-                    content += f"{text}\n"
+                    page_content += f"{text}\n"
 
-            for image_index in range(PdfSplitHandle.get_page_image_count(page)):
-                content += f"![image](image_{page_num}_{image_index})\n\n"
+            page_image_count = PdfSplitHandle.get_page_image_count(page)
+            # 页面文字量过低但含图片,判定为扫描页/图片页,对该页图片做 OCR 并输出识别文字
+            if len(page_content.strip()) < OCR_SPARSE_TEXT_THRESHOLD and page_image_count > 0:
+                page_content = PdfSplitHandle.ocr_page_images(page, page_content)
 
-            content = content.replace("\0", "")
+            page_content = page_content.replace("\0", "")
+            content += page_content
 
             elapsed_time = time.time() - start_time
             maxkb_logger.debug(f"File: {file.name}, Page: {page_num + 1}, Time: {elapsed_time:.3f}s")
 
         return content
+
+    @staticmethod
+    def ocr_page_images(page, page_content):
+        """对一页中的图片逐一 OCR,把识别文字追加到正文(不保留图片)"""
+        try:
+            images = page.images
+        except BaseException:
+            return page_content
+        for image in images:
+            try:
+                recognized_text = ocr_image(image.data)
+                if recognized_text:
+                    page_content += f"\n{recognized_text}\n"
+            except BaseException as e:
+                maxkb_logger.error(f"OCR page image error: {e}, {traceback.format_exc()}")
+        return page_content
 
     @staticmethod
     def extract_page_lines(page):
