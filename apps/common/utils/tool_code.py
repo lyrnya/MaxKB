@@ -5,9 +5,7 @@ import getpass
 import gzip
 import json
 import os
-import pwd
 import random
-import resource
 import socket
 import subprocess
 import sys
@@ -21,6 +19,13 @@ from django.utils.translation import gettext_lazy as _
 from maxkb.const import BASE_DIR, CONFIG, PROJECT_DIR
 
 from common.utils.logger import maxkb_logger
+
+if sys.platform.startswith("linux"):
+    import pwd
+    import resource
+else:
+    pwd = None
+    resource = None
 
 _enable_sandbox = bool(int(CONFIG.get("SANDBOX", 0)))
 _run_user = "sandbox" if _enable_sandbox else getpass.getuser()
@@ -109,7 +114,7 @@ class ToolExecutor:
         )
         set_run_user = (
             f"os.setgid({pwd.getpwnam(_run_user).pw_gid});os.setuid({pwd.getpwnam(_run_user).pw_uid});"
-            if _enable_sandbox
+            if _enable_sandbox and pwd is not None
             else ""
         )
         _exec_code = f"""
@@ -308,7 +313,7 @@ sys.stdout.flush()
         code = self._generate_mcp_server_code(code_str, params, name, description, tool_id)
         set_run_user = (
             f"os.setgid({pwd.getpwnam(_run_user).pw_gid});os.setuid({pwd.getpwnam(_run_user).pw_uid});"
-            if _enable_sandbox
+            if _enable_sandbox and pwd is not None
             else ""
         )
         return f"""
@@ -399,13 +404,14 @@ exec({dedent(code)!a})
                 os.sched_setaffinity(0, set(random.sample(list(os.sched_getaffinity(0)), _process_limit_cpu_cores)))
 
         try:
+            if sys.platform.startswith("linux"):
+                kwargs["preexec_fn"] = _set_resource_limit
             subprocess_result = subprocess.run(
                 [sys.executable, execute_file],
                 timeout=_process_limit_timeout_seconds,
                 text=True,
                 capture_output=True,
                 **kwargs,
-                preexec_fn=_set_resource_limit,
             )
             return subprocess_result
         except subprocess.TimeoutExpired:
