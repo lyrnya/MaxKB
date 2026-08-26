@@ -14,6 +14,7 @@ import time
 import traceback
 from typing import List
 
+import pdfplumber
 from django.utils.translation import gettext_lazy as _
 from pypdf import PdfReader
 from pypdf.generic import Destination
@@ -29,6 +30,12 @@ OCR_SPARSE_TEXT_THRESHOLD = 30
 
 # PDF 提取出的是视觉行,正文行占满整行宽度,标题行明显更短。取最长行宽的该比例作为标题行宽上限
 HEADING_LINE_WIDTH_RATIO = 0.7
+
+# markdown 表格骨架和标题标记,统计页面真实文字量时需要剔除
+MARKDOWN_SCAFFOLD_PATTERN = re.compile(r"[|\-#\s]")
+
+# pdfplumber 默认的固定字距阈值会在中英文/数字交界处插入多余空格,改成按字号比例判断
+X_TOLERANCE_RATIO = 0.3
 
 default_pattern_list = [
     re.compile("(?<=^)# .*|(?<=\\n)# .*"),
@@ -79,7 +86,7 @@ class PdfSplitHandle(BaseSplitHandle):
                 if type(with_filter) is str:
                     with_filter = with_filter.lower() == "true"
                 # 标题统一转成 markdown 标记后交给 SplitModel,分段标识/分段长度才能生效
-                content = self.handle_pdf_content(file, pdf_document)
+                content = self.handle_pdf_content(file, pdf_document, temp_file_path)
 
                 if pattern_list is not None and len(pattern_list) > 0:
                     split_model = SplitModel(pattern_list, with_filter, limit)
@@ -95,18 +102,19 @@ class PdfSplitHandle(BaseSplitHandle):
         return {"name": file.name, "content": split_model.parse(content)}
 
     @staticmethod
-    def handle_pdf_content(file, pdf_document):
-        # 第一步:收集所有字体大小
-        font_sizes = []
-        page_lines = []
-        for page in pdf_document.pages:
-            lines = PdfSplitHandle.extract_page_lines(page)
-            page_lines.append(lines)
-            for line_text, font_size in lines:
-                if line_text and font_size > 0:
-                    font_sizes.append(font_size)
+    def handle_pdf_content(file, pdf_document, pdf_path=None):
+        # 第一步:按版面把每页拆成有序的 block(文字行 / 表格),pdfplumber 不可用时退回 pypdf 视觉行
+        pages = PdfSplitHandle.extract_pages_by_layout(pdf_path) if pdf_path else None
+        if pages is None:
+            pages = PdfSplitHandle.extract_pages_by_text(pdf_document)
 
         # 计算正文字体大小(众数)
+        font_sizes = [
+            font_size
+            for blocks in pages
+            for kind, _value, font_size, _width in blocks
+            if kind == "line" and font_size > 0
+        ]
         if not font_sizes:
             body_font_size = 12
         else:
@@ -116,29 +124,34 @@ class PdfSplitHandle(BaseSplitHandle):
 
         # 标题识别:书签优先,没有书签时退回正文编号模式
         heading_titles = PdfSplitHandle.get_outline_headings(pdf_document)
-        heading_max_width = 0 if heading_titles else PdfSplitHandle.get_heading_max_width(page_lines)
+        line_widths = [width for blocks in pages for kind, _value, _font_size, width in blocks if kind == "line"]
+        heading_max_width = 0 if heading_titles else PdfSplitHandle.get_heading_max_width(line_widths)
 
         # 第二步:提取内容
         content = ""
-        for page_num, page in enumerate(pdf_document.pages):
+        for page_num, blocks in enumerate(pages):
             start_time = time.time()
             page_content = ""
 
-            for text, font_size in page_lines[page_num]:
-                if not text:
+            for kind, value, font_size, width in blocks:
+                if kind == "table":
+                    table_md = PdfSplitHandle.table_to_md(value)
+                    if table_md:
+                        page_content += f"\n{table_md}\n\n"
                     continue
 
                 heading_level = PdfSplitHandle.get_line_heading_level(
-                    text, font_size, body_font_size, heading_titles, heading_max_width
+                    value, font_size, body_font_size, heading_titles, heading_max_width, width
                 )
                 if heading_level is not None:
-                    page_content += f"{'#' * heading_level} {text}\n\n"
+                    page_content += f"{'#' * heading_level} {value}\n\n"
                 else:
-                    page_content += f"{text}\n"
+                    page_content += f"{value}\n"
 
+            page = pdf_document.pages[page_num]
             page_image_count = PdfSplitHandle.get_page_image_count(page)
             # 页面文字量过低但含图片,判定为扫描页/图片页,对该页图片做 OCR 并输出识别文字
-            if len(page_content.strip()) < OCR_SPARSE_TEXT_THRESHOLD and page_image_count > 0:
+            if PdfSplitHandle.get_real_text_length(page_content) < OCR_SPARSE_TEXT_THRESHOLD and page_image_count > 0:
                 page_content = PdfSplitHandle.ocr_page_images(page, page_content)
 
             page_content = page_content.replace("\0", "")
@@ -148,6 +161,105 @@ class PdfSplitHandle(BaseSplitHandle):
             maxkb_logger.debug(f"File: {file.name}, Page: {page_num + 1}, Time: {elapsed_time:.3f}s")
 
         return content
+
+    @staticmethod
+    def extract_pages_by_layout(pdf_path):
+        """
+        用 pdfplumber 按版面提取:表格还原成 markdown,表格以外的文字按视觉行输出。
+        PDF 里表格只是文字块加线段,没有行列语义,必须靠矢量线反推,否则窄列单元格的折行会被拆成独立文本行。
+        :return: 每页的 block 列表,pdfplumber 不可用时返回 None,交给 pypdf 兜底
+        """
+        try:
+            with pdfplumber.open(pdf_path) as pdf:
+                return [PdfSplitHandle.extract_layout_blocks(page) for page in pdf.pages]
+        except BaseException as e:
+            maxkb_logger.warning(f"pdfplumber layout extract failed, fallback to pypdf: {e}")
+            return None
+
+    @staticmethod
+    def extract_layout_blocks(page):
+        """把一页拆成有序 block,表格块和表格外的文字行统一按纵坐标排序,还原阅读顺序"""
+        try:
+            tables = page.find_tables()
+        except BaseException:
+            tables = []
+
+        blocks = []
+        for table in tables:
+            try:
+                blocks.append((table.bbox[1], ("table", table.extract(), 0, 0)))
+            except BaseException as e:
+                maxkb_logger.warning(f"pdfplumber table extract failed: {e}")
+
+        # 表格区域的文字已经在表格里,只取表格以外的部分,避免重复
+        region = page
+        for table in tables:
+            region = region.outside_bbox(table.bbox)
+        try:
+            text_lines = region.extract_text_lines(x_tolerance_ratio=X_TOLERANCE_RATIO)
+        except BaseException:
+            text_lines = []
+
+        for text_line in text_lines:
+            text = text_line["text"].strip()
+            if not text:
+                continue
+            chars = text_line.get("chars") or []
+            font_size = max((char.get("size") or 0 for char in chars), default=0)
+            # 有真实坐标,行宽直接用宽度,比字符数更准
+            blocks.append((text_line["top"], ("line", text, float(font_size), text_line["x1"] - text_line["x0"])))
+
+        blocks.sort(key=lambda block: block[0])
+        return [block for _top, block in blocks]
+
+    @staticmethod
+    def extract_pages_by_text(pdf_document):
+        """pypdf 兜底:只能拿到视觉行,没有表格结构,行宽用字符数近似"""
+        pages = []
+        for page in pdf_document.pages:
+            blocks = [
+                ("line", text, font_size, len(text))
+                for text, font_size in PdfSplitHandle.extract_page_lines(page)
+                if text
+            ]
+            pages.append(blocks)
+        return pages
+
+    @staticmethod
+    def table_to_md(rows):
+        """
+        表格转 markdown。合并单元格会在网格里留下全空的行列,直接输出全是噪声,入库前丢掉
+        """
+        rows = [[PdfSplitHandle.normalize_cell(cell) for cell in row] for row in rows]
+        rows = [row for row in rows if any(row)]
+        if not rows:
+            return ""
+
+        width = max(len(row) for row in rows)
+        rows = [row + [""] * (width - len(row)) for row in rows]
+        columns = [index for index in range(width) if any(row[index] for row in rows)]
+        if not columns:
+            return ""
+        rows = [[row[index] for index in columns] for row in rows]
+
+        md_table = "| " + " | ".join(rows[0]) + " |\n"
+        md_table += "| " + " | ".join(["---"] * len(rows[0])) + " |"
+        for row in rows[1:]:
+            md_table += "\n| " + " | ".join(row) + " |"
+        return md_table
+
+    @staticmethod
+    def normalize_cell(cell):
+        """单元格里的折行是列宽造成的,拼回一行;竖线会破坏 markdown 表格结构,需要转义"""
+        return (cell or "").replace("\n", "").replace("|", "\\|").strip()
+
+    @staticmethod
+    def get_real_text_length(page_content):
+        """
+        统计页面真实文字量。空白表单会输出只有骨架的 markdown 表格(9 列空表骨架就有 80 多个字符),
+        直接按长度判断会让扫描页躲过 OCR,所以先把骨架剔掉
+        """
+        return len(MARKDOWN_SCAFFOLD_PATTERN.sub("", page_content))
 
     @staticmethod
     def get_outline_headings(doc):
@@ -167,18 +279,17 @@ class PdfSplitHandle(BaseSplitHandle):
         }
 
     @staticmethod
-    def get_heading_max_width(page_lines):
+    def get_heading_max_width(line_widths):
         """
         正文行会占满整行宽度,标题行明显更短,用行宽把标题和折行的正文区分开
         :return: 标题行宽上限,无法判断时返回 0
         """
-        widths = [len(text) for lines in page_lines for text, _font_size in lines if text]
-        if not widths:
+        if not line_widths:
             return 0
-        return int(max(widths) * HEADING_LINE_WIDTH_RATIO)
+        return int(max(line_widths) * HEADING_LINE_WIDTH_RATIO)
 
     @staticmethod
-    def get_line_heading_level(text, font_size, body_font_size, heading_titles, heading_max_width):
+    def get_line_heading_level(text, font_size, body_font_size, heading_titles, heading_max_width, line_width):
         """
         判断一行文本的标题层级,返回 None 表示正文
         """
@@ -190,7 +301,7 @@ class PdfSplitHandle(BaseSplitHandle):
         if heading_titles:
             return 2 if text in heading_titles else None
 
-        if heading_max_width > 0 and len(text) <= heading_max_width:
+        if heading_max_width > 0 and line_width <= heading_max_width:
             level = detect_heading_level(text)
             if level is not None:
                 return min(level + 1, MAX_HEADING_LEVEL)
@@ -684,7 +795,7 @@ class PdfSplitHandle(BaseSplitHandle):
         try:
             with open(temp_file_path, "rb") as pdf_file:
                 pdf_document = PdfReader(pdf_file)
-                return self.handle_pdf_content(file, pdf_document)
+                return self.handle_pdf_content(file, pdf_document, temp_file_path)
         except BaseException as e:
             traceback.print_exception(e)
             return f"{e}"
