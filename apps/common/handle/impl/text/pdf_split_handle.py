@@ -20,11 +20,15 @@ from pypdf.generic import Destination
 
 from common.handle.base_split_handle import BaseSplitHandle
 from common.handle.impl.text.ocr_handle import ocr_image
+from common.utils.heading import MAX_HEADING_LEVEL, detect_heading_level
 from common.utils.logger import maxkb_logger
 from common.utils.split_model import SplitModel, smart_split_paragraph
 
 # 页面文字量低于该阈值且含图片时,判定为扫描页/图片页,触发 OCR
 OCR_SPARSE_TEXT_THRESHOLD = 30
+
+# PDF 提取出的是视觉行,正文行占满整行宽度,标题行明显更短。取最长行宽的该比例作为标题行宽上限
+HEADING_LINE_WIDTH_RATIO = 0.7
 
 default_pattern_list = [
     re.compile("(?<=^)# .*|(?<=\\n)# .*"),
@@ -74,17 +78,7 @@ class PdfSplitHandle(BaseSplitHandle):
                     limit = int(limit)
                 if type(with_filter) is str:
                     with_filter = with_filter.lower() == "true"
-                # 处理有目录的pdf
-                result = self.handle_toc(pdf_document, limit)
-                if result is not None:
-                    return {"name": file.name, "content": result}
-
-                # 没目录但是有链接的pdf
-                result = self.handle_links(pdf_document, pattern_list, with_filter, limit)
-                if result is not None and len(result) > 0:
-                    return {"name": file.name, "content": result}
-
-                # 没有目录的pdf
+                # 标题统一转成 markdown 标记后交给 SplitModel,分段标识/分段长度才能生效
                 content = self.handle_pdf_content(file, pdf_document)
 
                 if pattern_list is not None and len(pattern_list) > 0:
@@ -120,6 +114,10 @@ class PdfSplitHandle(BaseSplitHandle):
 
             body_font_size = Counter(font_sizes).most_common(1)[0][0]
 
+        # 标题识别:书签优先,没有书签时退回正文编号模式
+        heading_titles = PdfSplitHandle.get_outline_headings(pdf_document)
+        heading_max_width = 0 if heading_titles else PdfSplitHandle.get_heading_max_width(page_lines)
+
         # 第二步:提取内容
         content = ""
         for page_num, page in enumerate(pdf_document.pages):
@@ -130,14 +128,12 @@ class PdfSplitHandle(BaseSplitHandle):
                 if not text:
                     continue
 
-                # 根据与正文字体的差值判断
-                size_diff = font_size - body_font_size
-
-                if size_diff > 2:  # 明显大于正文
-                    page_content += f"## {text}\n\n"
-                elif size_diff > 0.5:  # 略大于正文
-                    page_content += f"### {text}\n\n"
-                else:  # 正文
+                heading_level = PdfSplitHandle.get_line_heading_level(
+                    text, font_size, body_font_size, heading_titles, heading_max_width
+                )
+                if heading_level is not None:
+                    page_content += f"{'#' * heading_level} {text}\n\n"
+                else:
                     page_content += f"{text}\n"
 
             page_image_count = PdfSplitHandle.get_page_image_count(page)
@@ -152,6 +148,57 @@ class PdfSplitHandle(BaseSplitHandle):
             maxkb_logger.debug(f"File: {file.name}, Page: {page_num + 1}, Time: {elapsed_time:.3f}s")
 
         return content
+
+    @staticmethod
+    def get_outline_headings(doc):
+        """
+        从书签中挑出真正的标题。书签常把编号段落(如“（一）……”)也挂进来,
+        只保留最外层且命中标题编号模式的条目。
+        :return: 标题文本集合,没有可用书签时返回空集合
+        """
+        toc = PdfSplitHandle.get_toc(doc)
+        if not toc:
+            return set()
+        top_level = min(level for level, _title, _page_number, _top in toc)
+        return {
+            title.strip()
+            for level, title, _page_number, _top in toc
+            if level == top_level and detect_heading_level(title) is not None
+        }
+
+    @staticmethod
+    def get_heading_max_width(page_lines):
+        """
+        正文行会占满整行宽度,标题行明显更短,用行宽把标题和折行的正文区分开
+        :return: 标题行宽上限,无法判断时返回 0
+        """
+        widths = [len(text) for lines in page_lines for text, _font_size in lines if text]
+        if not widths:
+            return 0
+        return int(max(widths) * HEADING_LINE_WIDTH_RATIO)
+
+    @staticmethod
+    def get_line_heading_level(text, font_size, body_font_size, heading_titles, heading_max_width):
+        """
+        判断一行文本的标题层级,返回 None 表示正文
+        """
+        # 明显大于正文的字号,作为文档/篇章大标题
+        if font_size - body_font_size > 2:
+            return 1
+
+        text = text.strip()
+        if heading_titles:
+            return 2 if text in heading_titles else None
+
+        if heading_max_width > 0 and len(text) <= heading_max_width:
+            level = detect_heading_level(text)
+            if level is not None:
+                return min(level + 1, MAX_HEADING_LEVEL)
+
+        # 略大于正文的字号
+        if font_size - body_font_size > 0.5:
+            return 2
+        return None
 
     @staticmethod
     def ocr_page_images(page, page_content):

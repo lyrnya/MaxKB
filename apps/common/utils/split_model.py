@@ -351,6 +351,44 @@ replace_map = {
     re.compile("\t+"): ''
 }
 
+# 过短分段的字数下限取 limit 的十分之一,但不超过该上限
+MAX_TINY_PARAGRAPH_LENGTH = 200
+
+
+def merge_tiny_paragraph(paragraph_list: List[Dict], limit: int):
+    """
+    合并过短的分段。按标题层级切分时容易产出只剩标题或几个字的碎片段,
+    把低于下限的段并入后一段,保证每段都有足够语义。
+    :param paragraph_list: 分段数据
+    :param limit:          最大分段字符数
+    :return: 合并后的分段数据
+    """
+    if len(paragraph_list) < 2:
+        return paragraph_list
+    min_length = min(max(limit // 10, 1), MAX_TINY_PARAGRAPH_LENGTH)
+    result, pending = [], None
+    for paragraph in paragraph_list:
+        current = {**paragraph}
+        if pending is not None:
+            merged = pending.get('content') + '\n' + current.get('content')
+            if len(merged) <= limit:
+                current['content'] = merged
+                current['title'] = pending.get('title') or current.get('title')
+            else:
+                result.append(pending)
+            pending = None
+        if len(current.get('content').strip()) < min_length:
+            pending = current
+            continue
+        result.append(current)
+    if pending is not None:
+        merged = (result[-1].get('content') + '\n' + pending.get('content')) if result else None
+        if merged is not None and len(merged) <= limit:
+            result[-1]['content'] = merged
+        else:
+            result.append(pending)
+    return result
+
 
 def filter_special_char(content: str):
     """
@@ -424,8 +462,9 @@ class SplitModel:
             if len(e['content']) > 4096:
                 pass
         title_list = list(set([row.get('title') for row in result]))
-        return [item for item in [self.post_reset_paragraph(row, title_list) for row in result] if
-                'content' in item and len(item.get('content').strip()) > 0]
+        result = [item for item in [self.post_reset_paragraph(row, title_list) for row in result] if
+                  'content' in item and len(item.get('content').strip()) > 0]
+        return merge_tiny_paragraph(result, self.limit)
 
     def post_reset_paragraph(self, paragraph: Dict, title_list: List[str]):
         result = self.content_is_null(paragraph, title_list)
