@@ -1,0 +1,35 @@
+name: Docker Build
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: table
+
+      - name: Pull base images
+        run: |
+          docker pull library/node:24-alpine
+          docker pull ghcr.io/1panel-dev/maxkb-base:python3.11-pg17.11-20260818
+
+      - name: Build Docker image
+        run: docker build -t maxkb-v2.0:latest -f installer/Dockerfile .
+
+      - name: Export image
+        run: |
+          docker save maxkb-v2.0:latest | gzip > maxkb-v2.0.0.tar.gz
+          sha256sum maxkb-v2.0.0.tar.gz > maxkb-v2.0.0.tar.gz.sha256
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: docker-image
+          path: |
+            maxkb-v2.0.0.tar.gz
+            maxkb-v2.0.0.tar.gz.sha256
+          retention-days: 7
