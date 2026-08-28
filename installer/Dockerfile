@@ -1,14 +1,19 @@
 FROM node:24-alpine AS web-build
 COPY ui ui
 RUN cd ui && ls -la && if [ -d "dist" ]; then exit 0; fi && \
-    npm install --prefer-offline --no-audit && \
-    npm install -D concurrently && \
-    NODE_OPTIONS="--max-old-space-size=4096" npx concurrently "npm run build" "npm run build-chat" && \
+    npm install --prefer-offline --no-audit --registry=https://registry.npmmirror.com && \
+    NODE_OPTIONS="--max-old-space-size=4096" npm run type-check && \
+    NODE_OPTIONS="--max-old-space-size=4096" npm run build-only && \
+    NODE_OPTIONS="--max-old-space-size=4096" npm run build-only-chat && \
     find . -maxdepth 1 ! -name '.' ! -name 'dist' ! -name 'public' -exec rm -rf {} +
 
 FROM ghcr.io/1panel-dev/maxkb-base:python3.11-pg17.11-20260818 AS stage-build
 COPY --chmod=700 . /opt/maxkb-app
-RUN apt-get update && \
+RUN sed -i \
+        's|http://deb.debian.org|https://mirrors.aliyun.com|g' \
+        /etc/apt/sources.list \
+        /etc/apt/sources.list.d/debian.sources && \
+    apt-get update && \
     apt-get install -y --no-install-recommends gcc g++ gettext libexpat1-dev libffi-dev && \
     apt-get clean all  && \
     rm -rf /var/lib/apt/lists/*
